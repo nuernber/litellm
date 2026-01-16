@@ -185,3 +185,111 @@ async def test_router_prompt_caching_same_cacheable_prefix_routes_to_same_deploy
         assert (
             model_id_1 == model_id_2 == model_id_3
         ), f"All requests should route to same deployment, but got: {model_id_1}, {model_id_2}, {model_id_3}"
+
+
+def test_extract_cacheable_prefix_string_content_with_cache_control():
+    """
+    Test fix for GitHub issue #19228: cache_control at message level with string content.
+    
+    Before fix: extract_cacheable_prefix returned [] when content was a string,
+    causing cache_key to be None even though caching was working.
+    """
+    from litellm.types.llms.openai import AllMessageValues
+    
+    messages: list[AllMessageValues] = [
+        {"role": "system", "content": "You are an LLM named Prompt Cache Helper"},
+        {
+            "role": "user",
+            "content": "large message here" * 100,
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+        },
+    ]
+    
+    # Test 1: extract_cacheable_prefix should work with string content
+    result = PromptCachingCache.extract_cacheable_prefix(messages)
+    assert len(result) == 2, f"Expected 2 messages in cacheable prefix, got {len(result)}"
+    assert result[1].get("cache_control") == {"type": "ephemeral", "ttl": "5m"}
+    
+    # Test 2: Cache key should be generated (was None before fix)
+    cache_key = PromptCachingCache.get_prompt_caching_cache_key(messages, None)
+    assert cache_key is not None, "Cache key should not be None (this was the bug in #19228)"
+    assert cache_key.startswith("deployment:")
+    assert cache_key.endswith(":prompt_caching")
+
+
+def test_extract_cacheable_prefix_string_vs_list_content():
+    """
+    Test that both string content (message-level cache_control) and 
+    list content (block-level cache_control) work correctly.
+    """
+    from litellm.types.llms.openai import AllMessageValues
+    
+    # String content with message-level cache_control
+    messages_string: list[AllMessageValues] = [
+        {
+            "role": "user",
+            "content": "String content",
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+    
+    # List content with block-level cache_control
+    messages_list: list[AllMessageValues] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "String content",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+    ]
+    
+    result_string = PromptCachingCache.extract_cacheable_prefix(messages_string)
+    result_list = PromptCachingCache.extract_cacheable_prefix(messages_list)
+    
+    assert len(result_string) == 1, "String content with cache_control should be detected"
+    assert len(result_list) == 1, "List content with cache_control should still work"
+    
+    # Both should generate cache keys
+    key_string = PromptCachingCache.get_prompt_caching_cache_key(messages_string, None)
+    key_list = PromptCachingCache.get_prompt_caching_cache_key(messages_list, None)
+    
+    assert key_string is not None, "String content should generate cache key"
+    assert key_list is not None, "List content should generate cache key"
+
+
+def test_cache_key_consistency_with_string_content():
+    """
+    Test that cache keys are consistent for same cacheable prefix with string content.
+    """
+    from litellm.types.llms.openai import AllMessageValues
+    
+    messages1: list[AllMessageValues] = [
+        {"role": "system", "content": "System"},
+        {
+            "role": "user",
+            "content": "Cached content",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"role": "user", "content": "Different follow-up 1"},
+    ]
+    
+    messages2: list[AllMessageValues] = [
+        {"role": "system", "content": "System"},
+        {
+            "role": "user",
+            "content": "Cached content",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"role": "user", "content": "Different follow-up 2"},
+    ]
+    
+    key1 = PromptCachingCache.get_prompt_caching_cache_key(messages1, None)
+    key2 = PromptCachingCache.get_prompt_caching_cache_key(messages2, None)
+    
+    assert key1 is not None
+    assert key2 is not None
+    assert key1 == key2, "Same cacheable prefix should produce same cache key"

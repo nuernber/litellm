@@ -61,6 +61,12 @@ class PromptCachingCache:
         (across all messages) that has cache_control. This includes ALL blocks before
         the last cacheable block (even if they don't have cache_control).
         
+        Supports two formats:
+        1. cache_control at message level (when content is a string):
+           {"role": "user", "content": "text", "cache_control": {"type": "ephemeral"}}
+        2. cache_control in content blocks (when content is a list):
+           {"role": "user", "content": [{"type": "text", "text": "...", "cache_control": {...}}]}
+        
         Args:
             messages: List of messages to extract cacheable prefix from
             
@@ -76,9 +82,20 @@ class PromptCachingCache:
         
         for msg_idx, message in enumerate(messages):
             content = message.get("content")
+            
+            # Check for cache_control at the message level (for string content)
             if not isinstance(content, list):
+                message_cache_control = message.get("cache_control")
+                if (
+                    message_cache_control is not None
+                    and isinstance(message_cache_control, dict)
+                    and message_cache_control.get("type") == "ephemeral"
+                ):
+                    last_cacheable_message_idx = msg_idx
+                    last_cacheable_content_idx = None  # No content index for string content
                 continue
             
+            # Check for cache_control in content blocks (for list content)
             for content_idx, content_block in enumerate(content):
                 if isinstance(content_block, dict):
                     cache_control = content_block.get("cache_control")
