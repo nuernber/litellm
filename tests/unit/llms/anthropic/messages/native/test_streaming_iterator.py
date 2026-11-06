@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import json
+import tracemalloc
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import datetime
 from typing import Final, Literal
@@ -1222,6 +1224,68 @@ async def test_async_sse_wrapper_drains_detached_when_cap_available(monkeypatch)
 
     assert any(c.startswith(b"event: message_stop\n") for c in iterator.logged_chunks)
     assert len(streaming_iterator_module._DETACHED_STREAM_DRAINS) == 0
+
+
+class _BilledChunkCountIterator(BaseAnthropicMessagesStreamingIterator):
+    def __init__(self, litellm_logging_obj: LiteLLMLoggingObj, billed_chunk_counts: list[int]):
+        super().__init__(litellm_logging_obj=litellm_logging_obj, request_body={})
+        self._billed_chunk_counts: Final = billed_chunk_counts
+
+    async def _handle_streaming_logging(self, collected_chunks, *, stream_teardown=False):
+        self._billed_chunk_counts.append(len(collected_chunks))
+
+
+@pytest.mark.asyncio
+async def test_async_sse_wrapper_releases_stalled_upstream_after_client_disconnect(monkeypatch):
+    """
+    Regression: when the provider stalls after the client disconnects, the detached pump kept the
+    provider stream open and every chunk it had buffered for billing alive until the provider read
+    timed out, so each such request leaked its whole response. The drain must stop at its time
+    limit, bill what it read, close the provider stream and free the buffer.
+    """
+    monkeypatch.setattr(streaming_iterator_module, "ANTHROPIC_MESSAGES_DETACHED_STREAM_DRAIN_TIMEOUT_SECONDS", 0)
+    requests: Final = 5
+    chunks_before_stall: Final = 50
+    payload: Final = "x" * 65536
+    response_bytes: Final = chunks_before_stall * len(payload)
+    provider_stalled: Final = asyncio.Event()
+    upstream_closed: Final = tuple(asyncio.Event() for _ in range(requests))
+    billed_chunk_counts: Final[list[int]] = []
+
+    async def _stalling_stream(closed: asyncio.Event):
+        try:
+            yield {"type": "message_start", "message": {"id": "m", "usage": {"input_tokens": 5, "output_tokens": 1}}}
+            for _ in range(chunks_before_stall):
+                yield {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": payload}}
+            await provider_stalled.wait()
+        finally:
+            closed.set()
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        baseline: Final = tracemalloc.get_traced_memory()[0]
+        for index, closed in enumerate(upstream_closed):
+            iterator = _BilledChunkCountIterator(_make_logging_obj(f"stalled_drain_{index}"), billed_chunk_counts)
+            gen = iterator.async_sse_wrapper(_stalling_stream(closed))
+            await gen.__anext__()
+            await gen.aclose()
+        try:
+            await asyncio.wait_for(asyncio.gather(*(closed.wait() for closed in upstream_closed)), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+        gc.collect()
+        retained: Final = tracemalloc.get_traced_memory()[0] - baseline
+        closed_while_stalled: Final = sum(closed.is_set() for closed in upstream_closed)
+        billed_while_stalled: Final = tuple(billed_chunk_counts)
+    finally:
+        tracemalloc.stop()
+        provider_stalled.set()
+        await asyncio.gather(*tuple(streaming_iterator_module._UPSTREAM_PUMP_TASKS), return_exceptions=True)
+
+    assert closed_while_stalled == requests, f"only {closed_while_stalled}/{requests} stalled provider streams closed"
+    assert retained < response_bytes, f"{retained} bytes still held after {requests} disconnected stalled streams"
+    assert billed_while_stalled == (chunks_before_stall + 1,) * requests
 
 
 def _decode_sse_events(events: tuple[bytes, ...]) -> list[tuple[str, dict]]:
